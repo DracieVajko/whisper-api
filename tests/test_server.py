@@ -1,6 +1,7 @@
-"""Offline tests for the lazy-loading fork (no torch/GPU needed).
+"""Offline tests for the lazy-loading server (no torch/GPU needed).
 
-Run: python -m pytest tests/ -q   (needs fastapi + pytest only)
+Run: python -m pytest tests/ -q   (needs fastapi + pytest only;
+torch / faster-whisper / uvicorn are stubbed, nothing loads VRAM).
 """
 
 import asyncio
@@ -11,7 +12,8 @@ import pytest
 from fastapi import HTTPException
 
 
-def _install_stubs(monkeypatch, calls, cuda_available=True, fail_cuda_load=False):
+def _install_stubs(monkeypatch, calls, cuda_available=True,
+                   fail_cuda_load=False, fail_cuda_infer=False):
     torch_mod = types.ModuleType("torch")
 
     class _Cuda:
@@ -20,11 +22,20 @@ def _install_stubs(monkeypatch, calls, cuda_available=True, fail_cuda_load=False
             return cuda_available
 
         @staticmethod
+        def get_device_capability(index=0):
+            return (8, 6)  # RTX 3060 (sm_86), mirrors production
+
+        @staticmethod
+        def get_device_name(index=0):
+            return "NVIDIA GeForce RTX 3060 Laptop GPU"
+
+        @staticmethod
         def empty_cache():
             calls.append("empty_cache")
 
     torch_mod.cuda = _Cuda
     torch_mod.version = types.SimpleNamespace(cuda="13.0")
+    torch_mod.__version__ = "2.14.1+cu130"  # mirrors production
     monkeypatch.setitem(sys.modules, "torch", torch_mod)
 
     fw = types.ModuleType("faster_whisper")
@@ -34,8 +45,12 @@ def _install_stubs(monkeypatch, calls, cuda_available=True, fail_cuda_load=False
             if device == "cuda" and fail_cuda_load:
                 raise RuntimeError("cublas64_12.dll missing")
             calls.append(("load", size, device, compute_type))
+            self._device = device
 
         def transcribe(self, path, **kwargs):
+            if self._device == "cuda" and fail_cuda_infer:
+                raise RuntimeError("Library cublas64_12.dll is not found or cannot be loaded")
+
             class _Seg:
                 text = "hello"
 
@@ -94,11 +109,12 @@ def test_first_transcribe_lazy_loads(monkeypatch):
 
 def test_model_switch_unloads_first(monkeypatch):
     calls = []
-    server = _fresh_server(monkeypatch, calls, cuda_available=False)
+    server = _fresh_server(monkeypatch, calls)
     _run(server.transcribe_audio(file=_Upload(), model="tiny", model_name=None, language=None, device=None))
     _run(server.transcribe_audio(file=_Upload(), model="small", model_name=None, language=None, device=None))
     loads = [c for c in calls if isinstance(c, tuple)]
-    assert loads == [("load", "tiny", "cpu", "int8"), ("load", "small", "cpu", "int8")]
+    assert loads == [("load", "tiny", "cuda", "float16"), ("load", "small", "cuda", "float16")]
+    assert "empty_cache" in calls  # switch unloaded first (gc + cuda.empty_cache)
 
 
 def test_unknown_model_400_without_load(monkeypatch):
@@ -153,3 +169,74 @@ def test_bad_extension_415_and_empty_400(monkeypatch):
     with pytest.raises(HTTPException) as e2:
         _run(server.transcribe_audio(file=_Upload(data=b""), model="tiny", model_name=None, language=None, device=None))
     assert e2.value.status_code == 400
+
+
+def test_whisper1_maps_to_default(monkeypatch):
+    calls = []
+    server = _fresh_server(monkeypatch, calls)
+    _run(server.transcribe_audio(file=_Upload(), model="whisper-1", model_name=None, language=None, device=None))
+    loads = [c for c in calls if isinstance(c, tuple)]
+    assert loads == [("load", "turbo", "cuda", "float16")]
+
+
+def test_inference_cublas_falls_back_to_cpu(monkeypatch):
+    """CUDA load succeeds but inference raises cublas error -> unload,
+    reload on CPU, retry once (production PC behavior)."""
+    calls = []
+    server = _fresh_server(monkeypatch, calls, fail_cuda_infer=True)
+    res = _run(server.transcribe_audio(file=_Upload(), model="tiny", model_name=None, language=None, device="cuda"))
+    assert '"hello"' in res.body.decode()
+    loads = [c for c in calls if isinstance(c, tuple)]
+    assert loads == [("load", "tiny", "cuda", "float16"), ("load", "tiny", "cpu", "int8")]
+    assert "empty_cache" in calls  # failed GPU model was unloaded first
+    assert server.health()["loaded_device"] == "cpu"
+
+
+def test_non_gpu_error_propagates_without_retry(monkeypatch):
+    """A genuine transcription error (not a CUDA library error) must not
+    trigger a pointless CPU reload."""
+    calls = []
+    server = _fresh_server(monkeypatch, calls)
+
+    def boom(model, path, language):
+        raise ValueError("bad audio")
+
+    monkeypatch.setattr(server, "_transcribe_file", boom)
+    with pytest.raises(ValueError):
+        _run(server.transcribe_audio(file=_Upload(), model="tiny", model_name=None, language=None, device="cuda"))
+    loads = [c for c in calls if isinstance(c, tuple)]
+    assert loads == [("load", "tiny", "cuda", "float16")]  # exactly one load, no retry
+
+
+def test_models_endpoint_loaded_state(monkeypatch):
+    calls = []
+    server = _fresh_server(monkeypatch, calls, cuda_available=False)
+    _run(server.transcribe_audio(file=_Upload(), model="small", model_name=None, language=None, device=None))
+    out = server.list_models()
+    assert out["loaded_model"] == "small"
+    assert out["loaded_device"] == "cpu"
+    assert out["loaded_compute_type"] == "int8"
+
+
+def test_health_loaded_fields(monkeypatch):
+    calls = []
+    server = _fresh_server(monkeypatch, calls, cuda_available=False)
+    _run(server.transcribe_audio(file=_Upload(), model="small", model_name=None, language=None, device=None))
+    h = server.health()
+    assert h["model_loaded"] is True
+    assert h["loaded_model"] == "small"
+    assert h["loaded_device"] == "cpu"
+    assert isinstance(h["idle_for_seconds"], float)
+
+
+def test_unload_model_cycle(monkeypatch):
+    calls = []
+    server = _fresh_server(monkeypatch, calls)
+    _run(server.transcribe_audio(file=_Upload(), model="tiny", model_name=None, language=None, device=None))
+    assert server.health()["model_loaded"] is True
+    assert server._unload_model("test") is True
+    assert "empty_cache" in calls
+    h = server.health()
+    assert h["model_loaded"] is False
+    assert h["loaded_model"] is None
+    assert server._unload_model("test") is False  # nothing to unload
