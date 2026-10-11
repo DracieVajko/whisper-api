@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+faster-whisper
+python-multipart
+# Pinned: av 19 removed `metadata_errors` used by faster-whisper decode.
+av==18.0.0
+# Torch: pick ONE line matching the machine.
+# GPU (CUDA 12/13): pip install torch --index-url https://download.pytorch.org/whl/cu130
+# CPU only:        pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch
